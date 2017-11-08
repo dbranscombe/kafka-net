@@ -56,6 +56,11 @@ namespace KafkaNet.Model
         /// The maximum time to wait when backing off on reconnection attempts.
         /// </summary>
         public TimeSpan? MaximumReconnectionTimeout { get; set; }
+        public string TslClientCertPfxPathOrCertStoreSubject { get; set; }
+        public string TslClientCertStoreFriendlyName { get; set; }
+        public bool TslSelfSignedTrainMode { get; set; }
+        public bool TslAllowSelfSignedServerCert { get; set; }
+        public string TslClientCertPassword { get; set; }
 
         public KafkaOptions(params Uri[] kafkaServerUri)
         {

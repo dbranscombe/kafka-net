@@ -1,8 +1,12 @@
 ﻿using System;
 using System.Collections.Generic;
 using System.Diagnostics;
+using System.IO;
 using System.Linq;
+using System.Net.Security;
 using System.Net.Sockets;
+using System.Security;
+using System.Security.Cryptography.X509Certificates;
 using System.Threading.Tasks;
 using System.Threading;
 using KafkaNet.Common;
@@ -41,6 +45,12 @@ namespace KafkaNet
         private readonly AsyncLock _clientLock = new AsyncLock();
         private TcpClient _client;
         private int _disposeCount;
+        private readonly Action _processNetworkstreamTasksAction;
+        private X509Certificate2 _clientCert;
+        private bool _selfSignedTrainMode;
+        private bool? _allowSelfSignedServerCert;
+        private SslStream _sslStream;
+        private NetworkStream _netStream;
 
         /// <summary>
         /// Construct socket and open connection to a specified server.
@@ -48,11 +58,25 @@ namespace KafkaNet
         /// <param name="log">Logging facility for verbose messaging of actions.</param>
         /// <param name="endpoint">The IP endpoint to connect to.</param>
         /// <param name="maximumReconnectionTimeout">The maximum time to wait when backing off on reconnection attempts.</param>
-        public KafkaTcpSocket(IKafkaLog log, KafkaEndpoint endpoint, TimeSpan? maximumReconnectionTimeout = null)
+        public KafkaTcpSocket(IKafkaLog log, KafkaEndpoint endpoint, TimeSpan? maximumReconnectionTimeout = null) : this(log, endpoint, maximumReconnectionTimeout ?? TimeSpan.FromMinutes(MaxReconnectionTimeoutMinutes), null)
         {
+        }
+
+        private KafkaTcpSocket(IKafkaLog log, KafkaEndpoint endpoint, TimeSpan? maximumReconnectionTimeout, KafkaOptions kafkaOptions)
+        {
+
             _log = log;
             _endpoint = endpoint;
             _maximumReconnectionTimeout = maximumReconnectionTimeout ?? TimeSpan.FromMinutes(MaxReconnectionTimeoutMinutes);
+            _processNetworkstreamTasksAction = ProcessNetworkstreamTasks;
+            _allowSelfSignedServerCert = kafkaOptions?.TslAllowSelfSignedServerCert;
+
+            if (!string.IsNullOrWhiteSpace(kafkaOptions?.TslClientCertPfxPathOrCertStoreSubject))
+            {         
+                _selfSignedTrainMode = kafkaOptions.TslSelfSignedTrainMode;
+                _clientCert = GetClientCert(kafkaOptions.TslClientCertPfxPathOrCertStoreSubject, kafkaOptions.TslClientCertStoreFriendlyName, kafkaOptions?.TslClientCertPassword);
+                _processNetworkstreamTasksAction = ProcessNetworkstreamTasksTsl;
+            }
 
             _sendTaskQueue = new AsyncCollection<SocketPayloadSendTask>();
             _readTaskQueue = new AsyncCollection<SocketPayloadReadTask>();
@@ -66,6 +90,37 @@ namespace KafkaNet
                 _sendTaskQueue.CompleteAdding();
                 _readTaskQueue.CompleteAdding();
             });
+        }
+
+        private X509Certificate2 GetClientCert(string clientCertSubject, string clientCertFriendlyName, string tslClientCertPassword)
+        {
+            return clientCertSubject.EndsWith(".pfx") ?  new X509Certificate2(clientCertSubject, tslClientCertPassword) : GetClientCertFromCertStore(clientCertSubject, clientCertFriendlyName);
+        }
+
+        private static X509Certificate2 GetClientCertFromCertStore(string clientCertSubject, string clientCertFriendlyName)
+        {
+            var store = new X509Store(StoreName.My, StoreLocation.LocalMachine);
+            store.Open(OpenFlags.ReadOnly);
+            X509Certificate2 cert = null;
+            var certs =
+                store.Certificates.Find(X509FindType.FindBySubjectName, clientCertSubject, false)
+                    .OfType<X509Certificate2>().ToList();
+            store.Close();
+            if (certs.Count > 0)
+            {
+                cert = certs.FirstOrDefault(x => x.FriendlyName == clientCertFriendlyName) ?? certs.First();
+            }
+
+            if (cert == null)
+            {
+                throw new Exception(
+                    $"Unable to find client certificate with subject {clientCertSubject} or friendly name {clientCertFriendlyName}");
+            }
+            return cert;
+        }
+
+        public KafkaTcpSocket(KafkaEndpoint endpoint, KafkaOptions kafkaOptions) : this(kafkaOptions.Log, endpoint, kafkaOptions.MaximumReconnectionTimeout, kafkaOptions)
+        {
 
         }
 
@@ -120,15 +175,15 @@ namespace KafkaNet
 
         private Task<KafkaDataPayload> EnqueueWriteTask(KafkaDataPayload payload, CancellationToken cancellationToken)
         {
-            var sendTask = new SocketPayloadSendTask(payload, cancellationToken);
+            var sendTask = new SocketPayloadSendTask(payload, cancellationToken, _log);
             _sendTaskQueue.Add(sendTask);
-            StatisticsTracker.QueueNetworkWrite(_endpoint, payload);
+            //StatisticsTracker.QueueNetworkWrite(_endpoint, payload);
             return sendTask.Tcp.Task;
         }
 
         private Task<byte[]> EnqueueReadTask(int readSize, CancellationToken cancellationToken)
         {
-            var readTask = new SocketPayloadReadTask(readSize, cancellationToken);
+            var readTask = new SocketPayloadReadTask(readSize, cancellationToken, _log);
             _readTaskQueue.Add(readTask);
             return readTask.Tcp.Task;
         }
@@ -139,10 +194,7 @@ namespace KafkaNet
             {
                 try
                 {
-                    //block here until we can get connections then start loop pushing data through network stream
-                    var netStream = GetStreamAsync().Result;
-
-                    ProcessNetworkstreamTasks(netStream);
+                    _processNetworkstreamTasksAction();
                 }
                 catch (Exception ex)
                 {
@@ -167,7 +219,82 @@ namespace KafkaNet
             }
         }
 
-        private void ProcessNetworkstreamTasks(NetworkStream netStream)
+        private void ProcessNetworkstreamTasks()
+        {
+            CreateNetStream();
+            ProcessNetworkstreamTasks(_netStream);
+        }
+
+        private void ProcessNetworkstreamTasksTsl()
+        {
+            CreateNetStream();
+            CreateSslStream();     
+            ProcessNetworkstreamTasks(_sslStream);
+        }
+
+
+        private void CreateSslStream()
+        {
+            AssignNewSslStream();            
+            _sslStream.AuthenticateAsClient(_endpoint.ServeUri.Host, new X509Certificate2Collection(_clientCert), System.Security.Authentication.SslProtocols.Tls12, false);  
+        }
+
+        private void CreateNetStream()
+        {          
+            if (_netStream != null)
+            {
+                _log.WarnFormat("Non-null net stream found. Disposing before reassignment.");
+                _netStream.DisposeSafely(_log);
+            }
+
+            _netStream = GetStreamAsync().Result;
+        }
+
+
+        private void AssignNewSslStream()
+        {
+            if (_sslStream != null)
+            {
+                _log.WarnFormat("Non-null ssl stream found. Disposing before reassignment");
+                _sslStream.DisposeSafely(_log);
+            }
+            _sslStream = new SslStream(_netStream, true, VerifyServerCertificate, null);
+        }
+
+        private bool VerifyServerCertificate(object sender, X509Certificate certificate, X509Chain chain, SslPolicyErrors sslpolicyerrors)
+        {
+            if (sslpolicyerrors == SslPolicyErrors.None)
+            {
+                return true;
+            }
+
+            if (_allowSelfSignedServerCert.HasValue && _allowSelfSignedServerCert.Value)
+            {
+                var store = new X509Store(StoreName.TrustedPeople, StoreLocation.LocalMachine);
+
+                store.Open(OpenFlags.ReadOnly);
+
+                var serverCert =
+                    store.Certificates.Find(X509FindType.FindByThumbprint, ((X509Certificate2)certificate).Thumbprint, false)
+                        .OfType<X509Certificate2>()
+                        .FirstOrDefault();
+                store.Close();
+                var match = certificate.Equals(serverCert);
+                if (!match && _selfSignedTrainMode)
+                {
+                    store.Open(OpenFlags.ReadWrite);
+                    store.Add((X509Certificate2)certificate);
+                    store.Close();
+                    match = true;
+                }
+
+                return match;
+            }
+
+            return false;
+        }
+
+        private void ProcessNetworkstreamTasks(Stream netStream)
         {
             Task writeTask = Task.FromResult(true);
             Task readTask = Task.FromResult(true);
@@ -196,77 +323,79 @@ namespace KafkaNet
             }
         }
 
-        private async Task ProcessReadTaskAsync(NetworkStream netStream, SocketPayloadReadTask readTask)
+        private async Task ProcessReadTaskAsync(Stream netStream, SocketPayloadReadTask readTask)
         {
             using (readTask)
             {
-                try
+                if (readTask != null)
                 {
-                    StatisticsTracker.IncrementGauge(StatisticGauge.ActiveReadOperation);
-                    var readSize = readTask.ReadSize;
-                    var result = new List<byte>(readSize);
-                    var bytesReceived = 0;
-
-                    while (bytesReceived < readSize)
+                    try
                     {
-                        readSize = readSize - bytesReceived;
-                        var buffer = new byte[readSize];
+                        //StatisticsTracker.IncrementGauge(StatisticGauge.ActiveReadOperation);
+                        var readSize = readTask.ReadSize;
+                        var result = new List<byte>(readSize);
+                        var bytesReceived = 0;
 
-                        if (OnReadFromSocketAttempt != null) OnReadFromSocketAttempt(readSize);
-
-                        bytesReceived = await netStream.ReadAsync(buffer, 0, readSize, readTask.CancellationToken)
-                            .WithCancellation(readTask.CancellationToken).ConfigureAwait(false);
-
-                        if (OnBytesReceived != null) OnBytesReceived(bytesReceived);
-
-                        if (bytesReceived <= 0)
+                        while (bytesReceived < readSize)
                         {
-                            using (_client)
+                            readSize = readSize - bytesReceived;
+                            var buffer = new byte[readSize];
+
+                            if (OnReadFromSocketAttempt != null) OnReadFromSocketAttempt(readSize);
+
+                            bytesReceived = await netStream.ReadAsync(buffer, 0, readSize, readTask.CancellationToken)
+                                .WithCancellation(readTask.CancellationToken).ConfigureAwait(false);
+
+                            if (OnBytesReceived != null) OnBytesReceived(bytesReceived);
+
+                            if (bytesReceived <= 0)
                             {
+                                _client.DisposeSafely(_log);                                                              
                                 _client = null;
-                                throw new ServerDisconnectedException(string.Format("Lost connection to server: {0}", _endpoint));
+                                throw new ServerDisconnectedException(string.Format("Lost connection to server: {0}, Bytes Received {1}", _endpoint, bytesReceived));
+                                
                             }
+
+                            result.AddRange(buffer.Take(bytesReceived));
                         }
 
-                        result.AddRange(buffer.Take(bytesReceived));
+                        readTask.Tcp.TrySetResult(result.ToArray());
                     }
-
-                    readTask.Tcp.TrySetResult(result.ToArray());
-                }
-                catch (Exception ex)
-                {
-                    if (_disposeToken.IsCancellationRequested)
+                    catch (Exception ex)
                     {
-                        var exception = new ObjectDisposedException("Object is disposing.");
-                        readTask.Tcp.TrySetException(exception);
-                        throw exception;
-                    }
+                        if (_disposeToken.IsCancellationRequested)
+                        {
+                            var exception = new ObjectDisposedException("Object is disposing.");
+                            readTask?.Tcp.TrySetException(exception);
+                            throw exception;
+                        }
 
-                    if (ex is ServerDisconnectedException)
-                    {
+                        if (ex is ServerDisconnectedException)
+                        {
+                            readTask.Tcp.TrySetException(ex);
+                            throw;
+                        }
+
+                        //if an exception made us lose a connection throw disconnected exception
+                        if (_client == null || _client.Connected == false)
+                        {
+                            var exception = new ServerDisconnectedException(string.Format("Lost connection to server: {0}", _endpoint), ex);
+                            readTask.Tcp.TrySetException(exception);
+                            throw exception;
+                        }
+
                         readTask.Tcp.TrySetException(ex);
                         throw;
                     }
-
-                    //if an exception made us lose a connection throw disconnected exception
-                    if (_client == null || _client.Connected == false)
+                    finally
                     {
-                        var exception = new ServerDisconnectedException(string.Format("Lost connection to server: {0}", _endpoint));
-                        readTask.Tcp.TrySetException(exception);
-                        throw exception;
-                    }
-
-                    readTask.Tcp.TrySetException(ex);
-                    throw;
-                }
-                finally
-                {
-                    StatisticsTracker.DecrementGauge(StatisticGauge.ActiveReadOperation);
+                        //StatisticsTracker.DecrementGauge(StatisticGauge.ActiveReadOperation);
+                    } 
                 }
             }
         }
 
-        private async Task ProcessSentTasksAsync(NetworkStream netStream, SocketPayloadSendTask sendTask)
+        private async Task ProcessSentTasksAsync(Stream netStream, SocketPayloadSendTask sendTask)
         {
             if (sendTask == null) return;
 
@@ -277,7 +406,7 @@ namespace KafkaNet
                 try
                 {
                     sw.Restart();
-                    StatisticsTracker.IncrementGauge(StatisticGauge.ActiveWriteOperation);
+                    //StatisticsTracker.IncrementGauge(StatisticGauge.ActiveWriteOperation);
 
                     if (OnWriteToSocketAttempt != null) OnWriteToSocketAttempt(sendTask.Payload);
                     await netStream.WriteAsync(sendTask.Payload.Buffer, 0, sendTask.Payload.Buffer.Length).ConfigureAwait(false);
@@ -299,8 +428,8 @@ namespace KafkaNet
                 }
                 finally
                 {
-                    StatisticsTracker.DecrementGauge(StatisticGauge.ActiveWriteOperation);
-                    StatisticsTracker.CompleteNetworkWrite(sendTask.Payload, sw.ElapsedMilliseconds, failed);
+                    //StatisticsTracker.DecrementGauge(StatisticGauge.ActiveWriteOperation);
+                    //StatisticsTracker.CompleteNetworkWrite(sendTask.Payload, sw.ElapsedMilliseconds, failed);
                 }
             }
         }
@@ -329,14 +458,14 @@ namespace KafkaNet
             var reconnectionDelay = DefaultReconnectionTimeout;
             _log.WarnFormat("No connection to:{0}.  Attempting to connect...", _endpoint);
 
-            _client = null;
+            DisposeClientIfNotNull();
 
             while (_disposeToken.IsCancellationRequested == false)
             {
                 try
                 {
                     if (OnReconnectionAttempt != null) OnReconnectionAttempt(attempts++);
-                    _client = new TcpClient();
+                    AssignNewClient();
                     await _client.ConnectAsync(_endpoint.Endpoint.Address, _endpoint.Endpoint.Port).ConfigureAwait(false);
                     _log.WarnFormat("Connection established to:{0}.", _endpoint);
                     return _client;
@@ -355,31 +484,73 @@ namespace KafkaNet
             return _client;
         }
 
+        private void AssignNewClient()
+        {
+            DisposeClientIfNotNull();
+
+            _client = new TcpClient();
+        }
+
+        private void DisposeClientIfNotNull()
+        {
+            if (_client != null)
+            {
+                _log.WarnFormat("Non-null TCP client found. Disposing before reassignment");
+                _client.DisposeSafely(_log);                              
+                _client = null;
+                
+            }
+        }
+
         public void Dispose()
         {
             if (Interlocked.Increment(ref _disposeCount) != 1) return;
-            if (_disposeToken != null) _disposeToken.Cancel();
+            _disposeToken?.Cancel();
+            _socketTask.SafeWait(TimeSpan.FromSeconds(30));
 
-            using (_disposeToken)
-            using (_disposeRegistration)
-            using (_client)
-            using (_socketTask)
+            _socketTask.DisposeSafely(_log);
+            _sslStream.DisposeSafely(_log);
+            _netStream.DisposeSafely(_log);
+            _client.DisposeSafely(_log);
+            _disposeRegistration.DisposeSafely(_log);
+            _disposeToken.DisposeSafely(_log);
+        }
+    }
+
+    static class ObjectExtensions
+    {
+        public static void DisposeSafely(this object objToDispose, IKafkaLog log)
+        {
+            var disposable = objToDispose as IDisposable;
+
+            if (disposable != null)
             {
-                _socketTask.SafeWait(TimeSpan.FromSeconds(30));
+                var className = disposable.GetType().Name;
+                try
+                {
+                    disposable.Dispose();
+                    log?.DebugFormat("Successfully disposed {0}", className);
+                }
+                catch (Exception e)
+                {
+                    log?.WarnFormat("Error disposing {0}, Exception {1}", className, e);
+                }
             }
         }
     }
 
     class SocketPayloadReadTask : IDisposable
     {
+        private readonly IKafkaLog _log;
         public CancellationToken CancellationToken { get; private set; }
         public TaskCompletionSource<byte[]> Tcp { get; set; }
         public int ReadSize { get; set; }
 
         private readonly CancellationTokenRegistration _cancellationTokenRegistration;
 
-        public SocketPayloadReadTask(int readSize, CancellationToken cancellationToken)
+        public SocketPayloadReadTask(int readSize, CancellationToken cancellationToken, IKafkaLog log)
         {
+            _log = log;
             CancellationToken = cancellationToken;
             Tcp = new TaskCompletionSource<byte[]>();
             ReadSize = readSize;
@@ -388,22 +559,21 @@ namespace KafkaNet
 
         public void Dispose()
         {
-            using (_cancellationTokenRegistration)
-            {
-
-            }
+            _cancellationTokenRegistration.DisposeSafely(_log);
         }
     }
 
     class SocketPayloadSendTask : IDisposable
     {
+        private readonly IKafkaLog _log;
         public TaskCompletionSource<KafkaDataPayload> Tcp { get; set; }
         public KafkaDataPayload Payload { get; set; }
 
         private readonly CancellationTokenRegistration _cancellationTokenRegistration;
 
-        public SocketPayloadSendTask(KafkaDataPayload payload, CancellationToken cancellationToken)
+        public SocketPayloadSendTask(KafkaDataPayload payload, CancellationToken cancellationToken, IKafkaLog log)
         {
+            _log = log;
             Tcp = new TaskCompletionSource<KafkaDataPayload>();
             Payload = payload;
             _cancellationTokenRegistration = cancellationToken.Register(() => Tcp.TrySetCanceled());
@@ -411,10 +581,7 @@ namespace KafkaNet
 
         public void Dispose()
         {
-            using (_cancellationTokenRegistration)
-            {
-
-            }
+            _cancellationTokenRegistration.DisposeSafely(_log);
         }
     }
 

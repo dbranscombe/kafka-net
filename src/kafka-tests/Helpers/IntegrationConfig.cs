@@ -21,5 +21,10 @@ namespace kafka_tests.Helpers
                 return new Uri(url);
             }
         }
+
+        public static string TslCertPath => ConfigurationManager.AppSettings["TslCertPath"];
+        public static string TslCertPassword => ConfigurationManager.AppSettings["TslCertPassword"];
+        public static bool TslUseStrict => bool.Parse(ConfigurationManager.AppSettings["TslUseStrict"]);
+
     }
 }

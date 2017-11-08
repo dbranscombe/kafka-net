@@ -90,7 +90,7 @@ namespace KafkaNet.Protocol
                     CorrelationId = request.CorrelationId,
                     MessageCount = request.Payload.Sum(x => x.Messages.Count)
                 };
-                StatisticsTracker.RecordProduceRequest(result.MessageCount, result.Buffer.Length, totalCompressedBytes);
+                //StatisticsTracker.RecordProduceRequest(result.MessageCount, result.Buffer.Length, totalCompressedBytes);
                 return result;
             }
         }

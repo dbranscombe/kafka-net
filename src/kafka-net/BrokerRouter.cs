@@ -33,7 +33,8 @@ namespace KafkaNet
 
             foreach (var endpoint in _kafkaOptions.KafkaServerEndpoints)
             {
-                var conn = _kafkaOptions.KafkaConnectionFactory.Create(endpoint, _kafkaOptions.ResponseTimeoutMs, _kafkaOptions.Log, _kafkaOptions.MaximumReconnectionTimeout);
+                //var conn = _kafkaOptions.KafkaConnectionFactory.Create(endpoint, _kafkaOptions.ResponseTimeoutMs, _kafkaOptions.Log, _kafkaOptions.MaximumReconnectionTimeout);
+                var conn = _kafkaOptions.KafkaConnectionFactory.Create(endpoint, _kafkaOptions);
                 _defaultConnectionIndex.AddOrUpdate(endpoint, e => conn, (e, c) => conn);
             }
 
@@ -195,7 +196,8 @@ namespace KafkaNet
         
         private void UpdateInternalMetadataCache(MetadataResponse metadata)
         {
-
+            if (metadata == null) return;
+    
             //resolve each broker
             var brokerEndpoints = metadata.Brokers.Select(broker => new
             {
@@ -244,8 +246,19 @@ namespace KafkaNet
 
         public void Dispose()
         {
-            _defaultConnectionIndex.Values.ToList().ForEach(conn => { using (conn) { } });
-            _brokerConnectionIndex.Values.ToList().ForEach(conn => { using (conn) { } });
+            _kafkaMetadataProvider.Dispose();
+            _defaultConnectionIndex.Values.ToList().ForEach(conn =>
+            {
+                var endpoint = conn.Endpoint.ServeUri.ToString();
+                using (conn) { }
+                _kafkaOptions.Log.WarnFormat("Closing default connection {0}", endpoint);
+            });
+            _brokerConnectionIndex.Values.ToList().ForEach(conn =>
+            {
+                var endpoint = conn.Endpoint.ServeUri.ToString();
+                using (conn) { }
+                _kafkaOptions.Log.WarnFormat("Closing broker connection {0}", endpoint);
+            });
         }
     }
 

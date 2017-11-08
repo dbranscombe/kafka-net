@@ -11,7 +11,7 @@
     <title>kafka-net</title>
     <requireLicenseAcceptance>false</requireLicenseAcceptance>
     <description>Provides high and low level classes for communicating with an Apache Kafka cluster.  The code is similar to the kafka-python library, but written entirely in C#.</description>
-    <summary>Native C# client for Apache Kafka.</summary>
+    <summary>Native C# client for Apache Kafka. Modified by Aesynt to support TSL</summary>
     <copyright>Copyright James Roland 2014</copyright>
     <tags>C# Apache Kafka</tags>
     <releaseNotes>https://github.com/Jroland/kafka-net/releases</releaseNotes>

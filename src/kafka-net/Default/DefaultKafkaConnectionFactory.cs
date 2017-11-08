@@ -14,6 +14,11 @@ namespace KafkaNet
             return new KafkaConnection(new KafkaTcpSocket(log, endpoint, maximumReconnectionTimeout), responseTimeoutMs, log);
         }
 
+        public IKafkaConnection Create(KafkaEndpoint endpoint, KafkaOptions kafkaOptions)
+        {
+            return new KafkaConnection(new KafkaTcpSocket(endpoint, kafkaOptions), kafkaOptions.ResponseTimeoutMs, kafkaOptions.Log);
+        }
+
         public KafkaEndpoint Resolve(Uri kafkaAddress, IKafkaLog log)
         {
             var ipAddress = GetFirstAddress(kafkaAddress.Host, log);
@@ -27,7 +32,6 @@ namespace KafkaNet
 
             return kafkaEndpoint;
         }
-
 
         private static IPAddress GetFirstAddress(string hostname, IKafkaLog log)
         {

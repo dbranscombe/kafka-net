@@ -32,7 +32,21 @@ namespace kafka_tests.Integration
         [Test]
         public async void SendAsyncShouldGetOneResultForMessage()
         {
-            using (var router = new BrokerRouter(new KafkaOptions(IntegrationConfig.IntegrationUri)))
+            var urls = new []
+            {
+                new Uri("http://go01.omnicellperformancecenter.com:9093"),
+                new Uri("http://go02.omnicellperformancecenter.com:9093"),
+                new Uri("http://go03.omnicellperformancecenter.com:9093")
+
+            };
+            var configs = new KafkaOptions(urls);
+            //configs.TslClientCertPfxPathOrCertStoreSubject = "./kafkaHA1.pfx";
+            configs.TslClientCertPfxPathOrCertStoreSubject = "./devtest-opc-client.omnicellanalytics.pfx";
+            configs.TslClientCertStoreFriendlyName = "Kafka HA";
+            configs.TslClientCertPassword = "0mn!Cell101";
+            configs.TslAllowSelfSignedServerCert = false;
+            configs.TslSelfSignedTrainMode = false;
+            using (var router = new BrokerRouter(configs))
             using (var producer = new Producer(router))
             {
                 var result = await producer.SendMessageAsync(IntegrationConfig.IntegrationTopic, new[] { new Message(Guid.NewGuid().ToString()) });

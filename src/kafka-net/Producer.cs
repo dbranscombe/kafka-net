@@ -231,80 +231,83 @@ namespace KafkaNet
 
         private async Task ProduceAndSendBatchAsync(List<TopicMessage> messages, CancellationToken cancellationToken)
         {
-            Interlocked.Add(ref _inFlightMessageCount, messages.Count);
-
-            //we must send a different produce request for each ack level and timeout combination.
-            foreach (var ackLevelBatch in messages.GroupBy(batch => new { batch.Acks, batch.Timeout }))
+            if (messages != null)
             {
-                var messageByRouter = ackLevelBatch.Select(batch => new
+                Interlocked.Add(ref _inFlightMessageCount, messages.Count);
+    
+                //we must send a different produce request for each ack level and timeout combination.
+                foreach (var ackLevelBatch in messages.GroupBy(batch => new { batch.Acks, batch.Timeout }))
                 {
-                    TopicMessage = batch,
-                    Route = BrokerRouter.SelectBrokerRoute(batch.Topic, batch.Message.Key),
-                })
-                                         .GroupBy(x => new { x.Route, x.TopicMessage.Topic, x.TopicMessage.Codec });
-
-                var sendTasks = new List<BrokerRouteSendBatch>();
-                foreach (var group in messageByRouter)
-                {
-                    var payload = new Payload
+                    var messageByRouter = ackLevelBatch.Select(batch => new
                     {
-                        Codec = group.Key.Codec,
-                        Topic = group.Key.Topic,
-                        Partition = group.Key.Route.PartitionId,
-                        Messages = group.Select(x => x.TopicMessage.Message).ToList()
-                    };
+                        TopicMessage = batch,
+                        Route = BrokerRouter.SelectBrokerRoute(batch.Topic, batch.Message.Key),
+                    })
+                                             .GroupBy(x => new { x.Route, x.TopicMessage.Topic, x.TopicMessage.Codec });
 
-                    var request = new ProduceRequest
+                    var sendTasks = new List<BrokerRouteSendBatch>();
+                    foreach (var group in messageByRouter)
                     {
-                        Acks = ackLevelBatch.Key.Acks,
-                        TimeoutMS = (int)ackLevelBatch.Key.Timeout.TotalMilliseconds,
-                        Payload = new List<Payload> { payload }
-                    };
-
-                    await _semaphoreMaximumAsync.WaitAsync(cancellationToken).ConfigureAwait(false);
-
-                    var brokerSendTask = new BrokerRouteSendBatch
-                    {
-                        Route = group.Key.Route,
-                        Task = group.Key.Route.Connection.SendAsync(request),
-                        MessagesSent = group.Select(x => x.TopicMessage).ToList()
-                    };
-
-                    //ensure the async is released as soon as each task is completed
-                    brokerSendTask.Task.ContinueWith(t => { _semaphoreMaximumAsync.Release(); }, cancellationToken);
-
-                    sendTasks.Add(brokerSendTask);
-                }
-
-                try
-                {
-                    await Task.WhenAll(sendTasks.Select(x => x.Task)).ConfigureAwait(false);
-
-                    foreach (var task in sendTasks)
-                    {
-                        //TODO when we dont ask for an ACK, result is an empty list.  Which FirstOrDefault returns null.  Dont like this...
-                        task.MessagesSent.ForEach(x => x.Tcs.TrySetResult(task.Task.Result.FirstOrDefault()));
-                    }
-                }
-                catch
-                {
-                    //if an error occurs here, all we know is some or all of the messages in this ackBatch failed.
-                    var failedTask = sendTasks.FirstOrDefault(t => t.Task.IsFaulted);
-                    if (failedTask != null)
-                    {
-                        foreach (var topicMessageBatch in ackLevelBatch)
+                        var payload = new Payload
                         {
-                            topicMessageBatch.Tcs.TrySetException(
-                                new KafkaApplicationException(
-                                    "An exception occured while executing a send operation against {0}.  Exception:{1}",
-                                    failedTask.Route, failedTask.Task.Exception));
+                            Codec = group.Key.Codec,
+                            Topic = group.Key.Topic,
+                            Partition = group.Key.Route.PartitionId,
+                            Messages = group.Select(x => x.TopicMessage.Message).ToList()
+                        };
+
+                        var request = new ProduceRequest
+                        {
+                            Acks = ackLevelBatch.Key.Acks,
+                            TimeoutMS = (int)ackLevelBatch.Key.Timeout.TotalMilliseconds,
+                            Payload = new List<Payload> { payload }
+                        };
+
+                        await _semaphoreMaximumAsync.WaitAsync(cancellationToken).ConfigureAwait(false);
+
+                        var brokerSendTask = new BrokerRouteSendBatch
+                        {
+                            Route = group.Key.Route,
+                            Task = group.Key.Route.Connection.SendAsync(request),
+                            MessagesSent = group.Select(x => x.TopicMessage).ToList()
+                        };
+
+                        //ensure the async is released as soon as each task is completed
+                        brokerSendTask.Task.ContinueWith(t => { _semaphoreMaximumAsync.Release(); }, cancellationToken);
+
+                        sendTasks.Add(brokerSendTask);
+                    }
+
+                    try
+                    {
+                        await Task.WhenAll(sendTasks.Select(x => x.Task)).ConfigureAwait(false);
+
+                        foreach (var task in sendTasks)
+                        {
+                            //TODO when we dont ask for an ACK, result is an empty list.  Which FirstOrDefault returns null.  Dont like this...
+                            task.MessagesSent.ForEach(x => x.Tcs.TrySetResult(task.Task.Result.FirstOrDefault()));
                         }
                     }
-                }
-                finally
-                {
-                    Interlocked.Add(ref _inFlightMessageCount, messages.Count * -1);
-                }
+                    catch
+                    {
+                        //if an error occurs here, all we know is some or all of the messages in this ackBatch failed.
+                        var failedTask = sendTasks.FirstOrDefault(t => t.Task.IsFaulted);
+                        if (failedTask != null)
+                        {
+                            foreach (var topicMessageBatch in ackLevelBatch)
+                            {
+                                topicMessageBatch.Tcs.TrySetException(
+                                    new KafkaApplicationException(
+                                        "An exception occured while executing a send operation against {0}.  Exception:{1}",
+                                        failedTask.Route, failedTask.Task.Exception));
+                            }
+                        }
+                    }
+                    finally
+                    {
+                        Interlocked.Add(ref _inFlightMessageCount, messages.Count * -1);
+                    }
+                } 
             }
         }
 

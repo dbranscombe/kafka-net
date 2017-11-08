@@ -22,5 +22,8 @@ namespace KafkaNet
         /// <param name="log">Logging interface used to record any log messages created by the Resolving process.</param>
         /// <returns>KafkaEndpoint with resolved IP and Address.</returns>
         KafkaEndpoint Resolve(Uri kafkaAddress, IKafkaLog log);
+
+        IKafkaConnection Create(KafkaEndpoint endpoint, KafkaOptions kafkaOptions);
+
     }
 }
